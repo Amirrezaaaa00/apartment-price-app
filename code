@@ -1,0 +1,324 @@
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import warnings
+warnings.filterwarnings('ignore')
+
+from sklearn.model_selection import train_test_split, KFold
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, median_absolute_error
+
+try:
+    from catboost import CatBoostRegressor
+except ImportError:
+    !pip install catboost
+    from catboost import CatBoostRegressor
+
+try:
+    import shap
+except ImportError:
+    !pip install shap
+    import shap
+
+# ------------------------------------------------------------
+# 1) لود و فیلتر اولیه داده‌ها
+# ------------------------------------------------------------
+from google.colab import drive
+drive.mount('/content/drive')
+
+file_path = "/content/drive/MyDrive/real_estate_ads.csv"
+df = pd.read_csv(file_path, low_memory=False)
+print(f"📊 شکل اولیه داده‌ها (Raw Shape): {df.shape}")
+
+df_clean = df[df['cat3_slug'] == 'apartment-sell'].copy()
+
+if 'token' in df_clean.columns:
+    df_clean = df_clean.drop_duplicates(subset=['token'])
+elif 'id' in df_clean.columns:
+    df_clean = df_clean.drop_duplicates(subset=['id'])
+elif 'post_id' in df_clean.columns:
+    df_clean = df_clean.drop_duplicates(subset=['post_id'])
+else:
+    potential_cols = ['city_slug', 'neighborhood_slug', 'building_size', 'price_value', 'created_at']
+    valid_cols = [c for c in potential_cols if c in df_clean.columns]
+    if valid_cols:
+        df_clean = df_clean.drop_duplicates(subset=valid_cols)
+
+df_clean['price_value'] = pd.to_numeric(df_clean['price_value'], errors='coerce')
+df_clean['building_size'] = pd.to_numeric(df_clean['building_size'], errors='coerce')
+df_clean = df_clean.dropna(subset=['price_value', 'building_size'])
+df_clean = df_clean[(df_clean['price_value'] >= 10_000_000) & (df_clean['building_size'] >= 15) & (df_clean['building_size'] <= 500)]
+
+# ------------------------------------------------------------
+# 2) آماده‌سازی متغیرهای پایه (قبل از Split -- فقط تبدیل ردیفی)
+# ------------------------------------------------------------
+rooms_map = {'بدون اتاق': 0, 'یک': 1, 'دو': 2, 'سه': 3, 'چهار': 4, 'پنج یا بیشتر': 5}
+df_clean['rooms_count'] = df_clean['rooms_count'].map(rooms_map) if 'rooms_count' in df_clean.columns else np.nan
+df_clean['rooms_count_missing'] = df_clean['rooms_count'].isnull().astype(int)
+
+df_clean['floor'] = pd.to_numeric(df_clean['floor'], errors='coerce') if 'floor' in df_clean.columns else np.nan
+df_clean['floor_missing'] = df_clean['floor'].isnull().astype(int)
+
+persian_to_english_digits = str.maketrans('۰۱۲۳۴۵۶۷۸۹', '0123456789')
+def clean_year(val):
+    if pd.isnull(val): return np.nan
+    val = str(val).translate(persian_to_english_digits)
+    try: return int(val)
+    except ValueError: return np.nan
+
+df_clean['construction_year'] = df_clean['construction_year'].apply(clean_year) if 'construction_year' in df_clean.columns else np.nan
+CURRENT_JALALI_YEAR = 1404
+df_clean['building_age'] = (CURRENT_JALALI_YEAR - df_clean['construction_year']).clip(lower=0, upper=80)
+df_clean['building_age_missing'] = df_clean['building_age'].isnull().astype(int)
+
+categorical_features = [
+    'deed_type', 'has_balcony', 'has_elevator', 'has_warehouse', 'has_parking',
+    'is_rebuilt', 'has_warm_water_provider', 'has_heating_system',
+    'has_cooling_system', 'has_restroom', 'building_direction', 'floor_material'
+]
+categorical_features = [c for c in categorical_features if c in df_clean.columns]
+
+for col in categorical_features:
+    df_clean[col] = df_clean[col].apply(lambda x: str(x).strip().lower() if pd.notnull(x) else np.nan)
+    df_clean[col] = df_clean[col].replace(['unselect', 'nan', 'none'], np.nan)
+    df_clean[col] = df_clean[col].fillna('unknown').astype('str')
+
+df_clean['city_slug'] = df_clean['city_slug'].fillna('unknown').astype(str) if 'city_slug' in df_clean.columns else 'unknown'
+df_clean['neighborhood_slug'] = df_clean['neighborhood_slug'].fillna('unknown').astype(str) if 'neighborhood_slug' in df_clean.columns else 'unknown'
+# ⭐ کلید ترکیبی شهر+محله از همینجا اصلی است (نه neighborhood_slug تنها)
+df_clean['city_neighborhood'] = df_clean['city_slug'] + '_' + df_clean['neighborhood_slug']
+
+# ------------------------------------------------------------
+# 3) SPLIT اول (کاملاً ایزوله کردن Train از Test)
+# ------------------------------------------------------------
+df_clean['log_price'] = np.log1p(df_clean['price_value'])
+
+train_idx, test_idx = train_test_split(df_clean.index, test_size=0.2, random_state=42)
+df_train = df_clean.loc[train_idx].copy()
+df_test  = df_clean.loc[test_idx].copy()
+print(f"✂️ حجم Train: {df_train.shape[0]} | حجم Test: {df_test.shape[0]}")
+
+# ------------------------------------------------------------
+# 4) حذف Outliers بر اساس Quantile (فقط از روی Train)
+# ------------------------------------------------------------
+df_train['price_per_meter'] = df_train['price_value'] / df_train['building_size']
+lower_ppm = df_train['price_per_meter'].quantile(0.01)
+upper_ppm = df_train['price_per_meter'].quantile(0.99)
+df_train = df_train[(df_train['price_per_meter'] >= lower_ppm) & (df_train['price_per_meter'] <= upper_ppm)]
+
+df_test['price_per_meter'] = df_test['price_value'] / df_test['building_size']
+df_test = df_test[(df_test['price_per_meter'] >= lower_ppm) & (df_test['price_per_meter'] <= upper_ppm)]
+
+# ------------------------------------------------------------
+# 5) Imputation عددی بر اساس Train
+# ------------------------------------------------------------
+for col in ['rooms_count', 'floor', 'building_age']:
+    if col in df_train.columns:
+        med = df_train[col].median()
+        df_train[col] = df_train[col].fillna(med)
+        df_test[col]  = df_test[col].fillna(med)
+
+# ------------------------------------------------------------
+# 6) مهندسی ویژگی‌های پیشرفته (تبدیل ردیفی -- بدون نشت)
+# ------------------------------------------------------------
+def apply_feature_engineering(df_target):
+    df_target['log_building_size'] = np.log1p(df_target['building_size'])
+    df_target['building_size_squared'] = df_target['building_size'] ** 2
+    df_target['age_squared'] = df_target['building_age'] ** 2
+    df_target['is_new'] = (df_target['building_age'] <= 3).astype(int)
+    df_target['price_per_room'] = df_target['building_size'] / (df_target['rooms_count'] + 1)
+    df_target['is_ground_floor'] = (df_target['floor'] == 0).astype(int)
+    df_target['is_top_floor'] = (df_target['floor'] >= 5).astype(int)
+    return df_target
+
+df_train = apply_feature_engineering(df_train)
+df_test  = apply_feature_engineering(df_test)
+
+# ------------------------------------------------------------
+# 7) Target Encoding با Smoothing (city + city_neighborhood فقط)
+# ------------------------------------------------------------
+def smoothed_group_mean(df, col, target, global_mean, m=30):
+    """گروه‌های با تعداد نمونه‌ی کم به سمت میانگین کلی کشیده می‌شوند
+    تا مدل روی نویز آماری گروه‌های کوچک (محله‌های با چند آگهی) overfit نکند."""
+    stats = df.groupby(col)[target].agg(['mean', 'count'])
+    stats['smoothed'] = (stats['count'] * stats['mean'] + m * global_mean) / (stats['count'] + m)
+    return stats['smoothed']
+
+def kfold_target_encode_train(df, col, target='log_price', n_splits=5, seed=42, m=30):
+    encoded = pd.Series(index=df.index, dtype=float)
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    global_mean = df[target].mean()
+    for tr_i, val_i in kf.split(df):
+        smoothed_means = smoothed_group_mean(df.iloc[tr_i], col, target, global_mean, m=m)
+        encoded.iloc[val_i] = df.iloc[val_i][col].map(smoothed_means).values
+    return encoded.fillna(global_mean)
+
+def apply_target_encode_test(df_train, df_test, col, target='log_price', m=30):
+    global_mean = df_train[target].mean()
+    smoothed_means = smoothed_group_mean(df_train, col, target, global_mean, m=m)
+    return df_test[col].map(smoothed_means).fillna(global_mean)
+
+# توجه: neighborhood_target_enc (بدون پیشوند شهر) عمداً حذف شد --
+# چون محله‌های هم‌نام در شهرهای مختلف را قاطی می‌کرد.
+df_train['city_target_enc'] = kfold_target_encode_train(df_train, 'city_slug', m=50)
+df_test['city_target_enc']  = apply_target_encode_test(df_train, df_test, 'city_slug', m=50)
+
+df_train['city_neighborhood_target_enc'] = kfold_target_encode_train(df_train, 'city_neighborhood', m=15)
+df_test['city_neighborhood_target_enc']  = apply_target_encode_test(df_train, df_test, 'city_neighborhood', m=15)
+
+# تشخیص: چند درصد محله‌ها آگهی کم دارند؟ (توجیه نیاز به smoothing)
+neigh_counts = df_train['city_neighborhood'].value_counts()
+print(f"تعداد محله‌های یکتا در train: {len(neigh_counts)}")
+print(f"میانه تعداد آگهی به‌ازای هر محله: {neigh_counts.median():.0f}")
+print(f"درصد محله‌هایی با کمتر از ۱۰ آگهی: {(neigh_counts < 10).mean()*100:.1f}٪")
+
+# ------------------------------------------------------------
+# 8) ساخت X و y نهایی برای مدل‌سازی
+# ------------------------------------------------------------
+explicit_drop = [
+    'cat2_slug', 'cat3_slug', 'neighborhood_slug', 'city_slug', 'city_neighborhood',
+    'location_latitude', 'location_longitude', 'price_value', 'log_price_value',
+    'price_per_meter', 'construction_year', 'created_at_month', 'created_at',
+    'token', 'id', 'post_id', 'rent_mode', 'rent_value', 'rent_to_single', 'rent_type',
+    'credit_mode', 'credit_value', 'rent_credit_transform', 'transformable_price',
+    'transformable_credit', 'transformed_credit', 'transformable_rent',
+    'transformed_rent', 'price_mode', 'land_size', 'regular_person_capacity',
+    'extra_person_capacity', 'cost_per_extra_person', 'rent_price_on_regular_days',
+    'rent_price_on_special_days', 'rent_price_at_weekends', 'has_pool',
+    'has_jacuzzi', 'has_sauna', 'property_type', 'location_radius', 'description',
+    'title', 'has_business_deed', 'has_barbecue', 'has_security_guard', 'has_gas',
+    'has_water', 'has_electricity', 'user_type', 'total_floors_count', 'unit_per_floor'
+]
+explicit_drop = [c for c in explicit_drop if c in df_train.columns]
+
+X_train_full = df_train.drop(columns=explicit_drop + ['log_price'])
+X_test_full  = df_test.drop(columns=explicit_drop + ['log_price'])
+X_test_full  = X_test_full[X_train_full.columns]
+
+y_train = df_train['log_price'].copy()
+y_test  = df_test['log_price'].copy()
+
+print(f"✅ تعداد ویژگی‌های نهایی (Features): {X_train_full.shape[1]}")
+
+# ------------------------------------------------------------
+# 8b) BASELINE  نقطه مرجع قبل از رفتن سراغ مدل پیچیده
+# ------------------------------------------------------------
+y_test_true = np.expm1(y_test)
+
+# --- Baseline 0: Naive (میانه ثابت train) ---
+naive_pred = np.full(len(y_test), np.expm1(y_train.median()))
+r2_naive = r2_score(y_test_true, naive_pred)
+mae_naive = mean_absolute_error(y_test_true, naive_pred)
+print(f"\n🔹 Baseline صفر (میانه ثابت)    → R2: {r2_naive:.4f}, MAE: {mae_naive:,.0f} تومان")
+
+# --- Baseline 1: فقط لوکیشن + متراژ (رگرسیون خطی ساده) ---
+simple_feats = [c for c in ['city_neighborhood_target_enc', 'log_building_size'] if c in X_train_full.columns]
+lin_model = LinearRegression()
+lin_model.fit(X_train_full[simple_feats], y_train)
+lin_pred = np.expm1(lin_model.predict(X_test_full[simple_feats]))
+r2_lin = r2_score(y_test_true, lin_pred)
+mae_lin = mean_absolute_error(y_test_true, lin_pred)
+print(f"🔹 Baseline ساده (لوکیشن+متراژ) → R2: {r2_lin:.4f}, MAE: {mae_lin:,.0f} تومان")
+print("   (اگر مدل نهایی خیلی نزدیک به این عدد باشد یعنی بقیه فیچرها ارزش افزوده کمی دارند)\n")
+
+# ------------------------------------------------------------
+# 9) آموزش مدل CatBoost با Cross-Validation 5-Fold
+# ------------------------------------------------------------
+kf = KFold(n_splits=5, shuffle=True, random_state=42)
+cat_features_idx = [X_train_full.columns.get_loc(c) for c in categorical_features if c in X_train_full.columns]
+
+catboost_params = {
+    'iterations': 1500,
+    'learning_rate': 0.03,
+    'depth': 6,
+    'l2_leaf_reg': 5.0,
+    'random_seed': 42,
+    'verbose': False,
+    'loss_function': 'RMSE',
+    'eval_metric': 'MAE'
+}
+
+models = []
+train_r2_scores = []
+val_r2_scores = []
+oof_predictions = np.zeros(len(X_train_full))
+
+for fold, (trn_idx, val_idx) in enumerate(kf.split(X_train_full)):
+    X_tr, y_tr = X_train_full.iloc[trn_idx], y_train.iloc[trn_idx]
+    X_va, y_va = X_train_full.iloc[val_idx], y_train.iloc[val_idx]
+
+    model = CatBoostRegressor(**catboost_params, early_stopping_rounds=100)
+    model.fit(X_tr, y_tr, eval_set=(X_va, y_va), cat_features=cat_features_idx, use_best_model=True)
+
+    tr_pred = model.predict(X_tr)
+    va_pred = model.predict(X_va)
+    tr_r2 = r2_score(np.expm1(y_tr), np.expm1(tr_pred))
+    va_r2 = r2_score(np.expm1(y_va), np.expm1(va_pred))
+
+    train_r2_scores.append(tr_r2)
+    val_r2_scores.append(va_r2)
+    models.append(model)
+    oof_predictions[val_idx] = va_pred
+
+    print(f"  Fold {fold+1}: Train R2={tr_r2:.4f} | Val R2={va_r2:.4f} | Gap={tr_r2 - va_r2:.4f}")
+
+# ------------------------------------------------------------
+# 10) پیش‌بینی و ارزیابی نهایی جامع
+# ------------------------------------------------------------
+y_test_pred_log = np.mean([m.predict(X_test_full) for m in models], axis=0)
+y_test_pred = np.expm1(y_test_pred_log)
+
+def calculate_mape(y_true, y_pred):
+    return np.mean(np.abs((y_true - y_pred) / y_true)) * 100
+
+mae_test = mean_absolute_error(y_test_true, y_test_pred)
+rmse_test = np.sqrt(mean_squared_error(y_test_true, y_test_pred))
+r2_test = r2_score(y_test_true, y_test_pred)
+mape_test = calculate_mape(y_test_true, y_test_pred)
+medae_test = median_absolute_error(y_test_true, y_test_pred)
+
+avg_train_r2 = np.mean(train_r2_scores)
+avg_val_r2 = np.mean(val_r2_scores)
+gap = avg_train_r2 - avg_val_r2
+
+print("\n" + "="*55)
+print("📈 گزارش پایش بیش‌برازش (Overfitting Monitoring):")
+print(f"  میانگین Train R²:      {avg_train_r2:.4f}")
+print(f"  میانگین Validation R²: {avg_val_r2:.4f}")
+print(f"  فاصله Train-Val:       {gap:.4f}  {'⚠️ overfitting محتمل' if gap > 0.05 else '✅ قابل قبول'}")
+print(f"  Test R² (کاملاً دیده‌نشده): {r2_test:.4f}")
+print(f"  فاصله Val-Test:        {abs(avg_val_r2 - r2_test):.4f}  {'⚠️ ناپایدار' if abs(avg_val_r2-r2_test) > 0.05 else '✅ سازگار'}")
+print("="*55)
+
+print("\n" + "="*55)
+print("📊 گزارش جامع مقایسه‌ای:")
+print(f"  Baseline صفر  → R2: {r2_naive:.4f}")
+print(f"  Baseline خطی  → R2: {r2_lin:.4f}")
+print(f"  مدل CatBoost  → R2: {r2_test:.4f}   (بهبود نسبت به baseline خطی: {r2_test - r2_lin:+.4f})")
+print(f"  MAE:      {mae_test:,.0f} تومان")
+print(f"  RMSE:     {rmse_test:,.0f} تومان")
+print(f"  MedianAE: {medae_test:,.0f} تومان")
+print(f"  MAPE:     {mape_test:.2f}%")
+print("="*55)
+
+# ------------------------------------------------------------
+# 11) تحلیل اهمیت ویژگی‌ها با SHAP
+# ------------------------------------------------------------
+print("\n⏳ در حال محاسبه مقادیر SHAP...")
+X_shap_sample = X_test_full.sample(min(1000, len(X_test_full)), random_state=42)
+explainer = shap.TreeExplainer(models[0])
+shap_values = explainer.shap_values(X_shap_sample)
+
+plt.figure(figsize=(10, 8))
+shap.summary_plot(shap_values, X_shap_sample, plot_type="bar", show=False)
+plt.title("اهمیت ویژگی‌ها بر اساس تحلیل SHAP", fontsize=12, pad=15)
+plt.tight_layout()
+plt.show()
+
+plt.figure(figsize=(10, 8))
+shap.summary_plot(shap_values, X_shap_sample, show=False)
+plt.title("جهت و میزان تأثیر هر ویژگی روی قیمت (SHAP Beeswarm)", fontsize=12, pad=15)
+plt.tight_layout()
+plt.show()
